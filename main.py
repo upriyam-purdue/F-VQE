@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Final
+from typing import List, Dict, Tuple, Final, Callable
 
 from pytket import Circuit
 from pytket.circuit.display import render_circuit_as_html
@@ -10,7 +10,10 @@ from pytket.passes import CommuteThroughMultis, RemoveRedundancies, SequencePass
 # globals
 _NUM_QUBITS: Final[int] = 5
 _CIRCUIT_BLOCK_DEPTH: Final[int] = 1
-_QUANTUM_BACKEND: Final[any] = AerBackend()  # connect to the backend
+
+_NUM_SHOTS_PER_CIRCUIT: Final[int] = 1000
+
+_QUANTUM_BACKEND: Final[any] = AerBackend()
 
 
 # noinspection PyPep8Naming
@@ -22,7 +25,18 @@ def _APPLY_ENERGY_FILTER(energy: float, tau: float) -> float:
 # noinspection PyPep8Naming
 def _APPLY_PROBLEM_COST_FUNCTION(input_binary_values: Tuple[int, ...]) -> float:
     # TODO implement problem cost function -- should be a minimization problem
-    pass
+    # MUST RETURN POSITIVE VALUES ONLY
+    # sample maxcut problem for 5 nodes
+    edges = [
+        ((0, 1), 5),
+        ((0, 2), 3),
+        ((1, 3), 1),
+        ((2, 4), 5),
+        ((3, 4), 7)
+    ]
+    total_edge_cost = sum(cost for _, cost in edges)
+    groups = [2 * binary_var - 1 for binary_var in input_binary_values]
+    return total_edge_cost + 0.5 - sum(cost if groups[edge[0]] != groups[edge[1]] else 0 for edge, cost in edges)
 
 
 # helper functions
@@ -49,45 +63,50 @@ def _simplify_circuit_for_args(circuit: Circuit, param_values: List[float]) -> C
     simplifier.apply(circuit_simplified)
 
     # return simplified circuit
-    return circuit
+    return circuit_simplified
 
 
 # measure circuit with filter
-def _measure_ansatz(compiled_circuit: Circuit, param_values: List[float], square_filtered_response: bool) -> float:
+def _measure_ansatz(compiled_circuit: Circuit, param_values: List[float],
+                    square_filtered_output: bool = False, apply_filter: bool = True) -> float:
     # simplify circuit
     circuit = _simplify_circuit_for_args(compiled_circuit, param_values)
 
     # get results of circuit
-    job_handle = _QUANTUM_BACKEND.process_circuit(circuit, 1000)  # submit the job to run the circuit
+    job_handle = _QUANTUM_BACKEND.process_circuit(circuit, _NUM_SHOTS_PER_CIRCUIT)  # submit the job to run the circuit
     counts = _QUANTUM_BACKEND.get_result(job_handle).get_counts()  # retrieve and summarise the results
-    print(counts)
 
     # compute value of tau --> see paper (https://arxiv.org/pdf/2106.10055.pdf) Section II.D (page 4)
     tau = 0.4  # TODO dynamically compute value of tau
 
     # process with Monte Carlo estimator --> see paper (https://arxiv.org/pdf/2106.10055.pdf) eq. 8 (page 4)
-    return sum(
-        count * _APPLY_ENERGY_FILTER(_APPLY_PROBLEM_COST_FUNCTION(q_state), tau)
-        for q_state, count in counts.items()
-    ) / len(counts)
+    def process_quantum_state(q_state: Tuple[int, ...]):
+        energy = _APPLY_PROBLEM_COST_FUNCTION(q_state)
+        if apply_filter:
+            energy = _APPLY_ENERGY_FILTER(energy, tau)
+            if square_filtered_output:
+                energy = energy ** 2
+        return energy
+
+    return sum(count * process_quantum_state(q_state) for q_state, count in counts.items()) / _NUM_SHOTS_PER_CIRCUIT
 
 
 # compute new params from old values
 def _compute_new_params(circuit: Circuit, param_values: List[float]) -> List[float]:
-    # memoize denominator value
-    derivative_denominator = 4 * sqrt(_measure_ansatz(circuit, param_values, True))  # 4 * sqrt(f_squared)
+    # memoize denominator value --> 4 * sqrt(f_squared)
+    derivative_denominator = 4 * sqrt(_measure_ansatz(circuit, param_values, square_filtered_output=True))
 
     # compute numerator values
     derivative_numerators = []
     for ind in range(len(param_values)):
         param_values[ind] += pi / 2
-        param_plus = _measure_ansatz(circuit, param_values, False)  # psi(j+)
+        param_plus = _measure_ansatz(circuit, param_values)  # psi(j+)
         param_values[ind] -= pi
-        param_minus = _measure_ansatz(circuit, param_values, False)  # psi(j-)
+        param_minus = _measure_ansatz(circuit, param_values)  # psi(j-)
         param_values[ind] += pi / 2
 
-        # -[psi(j+) - psi(j-)] --> see paper (https://arxiv.org/pdf/2106.10055.pdf) eq. 6 (page 3)
-        derivative_numerators.append(param_minus - param_plus)
+        # psi(j+) - psi(j-) --> see paper (https://arxiv.org/pdf/2106.10055.pdf) eq. 6 (page 3)
+        derivative_numerators.append(param_plus - param_minus)
 
     # compute learning rate --> see paper (https://arxiv.org/pdf/2106.10055.pdf) Table I (page 6)
     learning_rate = 1  # TODO compute learning rate
@@ -102,7 +121,7 @@ def _compute_new_params(circuit: Circuit, param_values: List[float]) -> List[flo
 
 def construct_circuit() -> Tuple[Circuit, List[float]]:
     # define circuit
-    c = Circuit(_NUM_QUBITS)
+    circuit = Circuit(_NUM_QUBITS)
 
     # set up gates
     # noinspection PyTypeChecker
@@ -111,7 +130,7 @@ def construct_circuit() -> Tuple[Circuit, List[float]]:
 
     def _add_parameterized_rotation_to_qubit(qubit_ind: int) -> None:
         nonlocal num_params
-        c.Ry(Symbol(f"alpha{num_params}"), qubit_ind)
+        circuit.Ry(Symbol(f"alpha{num_params}"), qubit_ind)
         last_param_index_by_qubit[qubit_ind] = num_params
         num_params += 1
 
@@ -120,30 +139,29 @@ def construct_circuit() -> Tuple[Circuit, List[float]]:
 
     for _ in range(_CIRCUIT_BLOCK_DEPTH):
         for i in range(1, _NUM_QUBITS, 2):
-            c.CX(i - 1, i)
+            circuit.CX(i - 1, i)
             _add_parameterized_rotation_to_qubit(i - 1)
             _add_parameterized_rotation_to_qubit(i)
 
         for i in range(2, _NUM_QUBITS, 2):
-            c.CX(i - 1, i)
+            circuit.CX(i - 1, i)
             _add_parameterized_rotation_to_qubit(i - 1)
             _add_parameterized_rotation_to_qubit(i)
 
-    c.measure_all()
+    circuit.measure_all()
 
     # initialize gate parameters --> see paper (https://arxiv.org/pdf/2106.10055.pdf) Table I (page 6)
     params = [0 for _ in range(num_params)]
     for last_param_index in last_param_index_by_qubit:
         params[last_param_index] = pi / 2
 
-    return c, params
+    return circuit, params
 
 
-def _output_circuit(circuit: Circuit, params: List[float]) -> None:
+def _output_circuit(circuit: Circuit, params: List[float], file_name: str = "out.html") -> None:
     circuit.symbol_substitution(_get_symbol_dict(params))
-    f = open("out.html", "w")
-    f.write(render_circuit_as_html(circuit))
-    f.close()
+    with open(file_name, "w") as file:
+        file.write(render_circuit_as_html(circuit))
 
 
 def _test_circuit_construction():
@@ -161,17 +179,21 @@ def _test_circuit_training():
     # compile circuit for backend (here, qiskit-aer = classical simulation)
     compiled = _QUANTUM_BACKEND.get_compiled_circuit(circuit)
 
-    # repeated training iterations
-    for iteration in range(10):
-        print(f"Starting iteration #{iteration}")
+    # before energy
+    print(f"Before Training: score = {_measure_ansatz(compiled, params, apply_filter=False)}")
+    print("---------------------------------------------------")
 
+    # repeated training iterations
+    for iteration in range(30):
         # update params
         params = _compute_new_params(compiled, params)
 
-        # TODO output intermediate values, etc.
+        # print current energy?
+        print(f"After Iteration #{iteration}: score = {_measure_ansatz(compiled, params, apply_filter=False)}")
 
     # after training
-    print("Training \"complete\"")
+    print("---------------------------------------------------")
+    print(f"After Training: score = {_measure_ansatz(compiled, params, apply_filter=False)}")
 
 
 if __name__ == '__main__':
