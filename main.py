@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Final, Callable
+from typing import List, Dict, Tuple, Final, Optional
 
 from pytket import Circuit
 from pytket.circuit.display import render_circuit_as_html
@@ -7,9 +7,11 @@ from numpy import pi, sqrt
 from pytket.extensions.qiskit import AerBackend
 from pytket.passes import CommuteThroughMultis, RemoveRedundancies, SequencePass, RepeatWithMetricPass
 
+from time import perf_counter
+
 # globals
-_NUM_QUBITS: Final[int] = 5
-_CIRCUIT_BLOCK_DEPTH: Final[int] = 1
+_NUM_QUBITS: Final[int] = 10
+_CIRCUIT_BLOCK_DEPTH: Final[int] = 5
 
 _NUM_SHOTS_PER_CIRCUIT: Final[int] = 1000
 
@@ -28,15 +30,25 @@ def _APPLY_PROBLEM_COST_FUNCTION(input_binary_values: Tuple[int, ...]) -> float:
     # MUST RETURN POSITIVE VALUES ONLY
     # sample maxcut problem for 5 nodes
     edges = [
-        ((0, 1), 5),
-        ((0, 2), 3),
-        ((1, 3), 1),
-        ((2, 4), 5),
-        ((3, 4), 7)
+        ((0, 5), 7),
+        ((0, 6), 6),
+        ((0, 9), 10),
+        ((1, 2), 10),
+        ((1, 3), 6),
+        ((1, 8), 5),
+        ((2, 3), 2),
+        ((2, 8), 5),
+        ((3, 6), 3),
+        ((4, 6), 8),
+        ((4, 7), 2),
+        ((4, 8), 7),
+        ((5, 7), 8),
+        ((5, 9), 10),
+        ((7, 9), 6),
     ]
     total_edge_cost = sum(cost for _, cost in edges)
     groups = [2 * binary_var - 1 for binary_var in input_binary_values]
-    return total_edge_cost + 0.5 - sum(cost if groups[edge[0]] != groups[edge[1]] else 0 for edge, cost in edges)
+    return total_edge_cost + 1.0 - sum(cost if groups[edge[0]] != groups[edge[1]] else 0 for edge, cost in edges)
 
 
 # helper functions
@@ -67,8 +79,8 @@ def _simplify_circuit_for_args(circuit: Circuit, param_values: List[float]) -> C
 
 
 # measure circuit with filter
-def _measure_ansatz(compiled_circuit: Circuit, param_values: List[float],
-                    square_filtered_output: bool = False, apply_filter: bool = True) -> float:
+def _measure_ansatz(compiled_circuit: Circuit, param_values: List[float], *,
+                    square_filtered_output: bool = False, apply_filter: bool) -> float:
     # simplify circuit
     circuit = _simplify_circuit_for_args(compiled_circuit, param_values)
 
@@ -92,24 +104,34 @@ def _measure_ansatz(compiled_circuit: Circuit, param_values: List[float],
 
 
 # compute new params from old values
-def _compute_new_params(circuit: Circuit, param_values: List[float]) -> List[float]:
+def _compute_new_params(circuit: Circuit, param_values: List[float],
+                        *, apply_filter: bool, iteration_number: Optional[int] = None) -> List[float]:
     # memoize denominator value --> 4 * sqrt(f_squared)
-    derivative_denominator = 4 * sqrt(_measure_ansatz(circuit, param_values, square_filtered_output=True))
+    derivative_denominator = \
+        4 * sqrt(_measure_ansatz(circuit, param_values, square_filtered_output=True, apply_filter=True)) \
+            if apply_filter else 2
 
     # compute numerator values
     derivative_numerators = []
     for ind in range(len(param_values)):
         param_values[ind] += pi / 2
-        param_plus = _measure_ansatz(circuit, param_values)  # psi(j+)
+        param_plus = _measure_ansatz(circuit, param_values, apply_filter=apply_filter)  # psi(j+)
         param_values[ind] -= pi
-        param_minus = _measure_ansatz(circuit, param_values)  # psi(j-)
+        param_minus = _measure_ansatz(circuit, param_values, apply_filter=apply_filter)  # psi(j-)
         param_values[ind] += pi / 2
 
         # psi(j+) - psi(j-) --> see paper (https://arxiv.org/pdf/2106.10055.pdf) eq. 6 (page 3)
         derivative_numerators.append(param_plus - param_minus)
 
     # compute learning rate --> see paper (https://arxiv.org/pdf/2106.10055.pdf) Table I (page 6)
-    learning_rate = 1  # TODO compute learning rate
+    if apply_filter:
+        # learning_rate = 1  # TODO compute learning rate
+        hessian_numerator = _measure_ansatz(circuit, param_values, apply_filter=True)
+        learning_rate = derivative_denominator / hessian_numerator
+    else:
+        learning_rate = -2.0 / _measure_ansatz(circuit, param_values, apply_filter=False)
+        if iteration_number is not None:
+            learning_rate /= iteration_number ** 0.3
 
     # return new parameters
     return [
@@ -172,7 +194,7 @@ def _test_circuit_construction():
     _output_circuit(circuit, params)
 
 
-def _test_circuit_training():
+def test_circuit_training():
     # get circuit & params list
     circuit, params = construct_circuit()
 
@@ -180,21 +202,34 @@ def _test_circuit_training():
     compiled = _QUANTUM_BACKEND.get_compiled_circuit(circuit)
 
     # before energy
-    print(f"Before Training: score = {_measure_ansatz(compiled, params, apply_filter=False)}")
+    prev_energy: float = _measure_ansatz(compiled, params, apply_filter=False)
+    print(f"Before Training: score = {prev_energy}")
     print("---------------------------------------------------")
 
+    time_tot = 0
     # repeated training iterations
-    for iteration in range(30):
+    for iteration in range(20):
         # update params
-        params = _compute_new_params(compiled, params)
+        start_time = perf_counter()
+        params = _compute_new_params(compiled, params, apply_filter=False, iteration_number=iteration + 1)
+        # new_energy = _measure_ansatz(compiled, new_params, apply_filter=False)
+        # if new_energy < prev_energy:
+        #     prev_energy = new_energy
+        #     params = new_params
+        # else:
+        #     prev_energy = _measure_ansatz(compiled, params, apply_filter=False)
+        end_time = perf_counter()
 
-        # print current energy?
-        print(f"After Iteration #{iteration}: score = {_measure_ansatz(compiled, params, apply_filter=False)}")
+        # print current problem cost of circuit
+        prev_energy = _measure_ansatz(compiled, params, apply_filter=False)
+        print(f"After Iteration #{iteration + 1}: score = {prev_energy}\ttime = {end_time - start_time}")
+        time_tot += end_time - start_time
 
     # after training
     print("---------------------------------------------------")
     print(f"After Training: score = {_measure_ansatz(compiled, params, apply_filter=False)}")
+    print(f"Time per iteration: {time_tot / 100} seconds")
 
 
 if __name__ == '__main__':
-    _test_circuit_training()
+    test_circuit_training()
